@@ -33,6 +33,33 @@ function getRankInfo(points) {
     return { name: 'ブロンズ', badge: '🥉ブロンズ', color: '#cd7f32' };
 }
 
+// ランキングデータ取得＆全クライアントへリアルタイム配信するヘルパー
+async function fetchRankingsData() {
+    const winsRes = await pool.query(
+        'SELECT username, wins, rank_points FROM users ORDER BY wins DESC, rank_points DESC LIMIT 5'
+    );
+    const rankRes = await pool.query(
+        'SELECT username, rank_points, wins FROM users ORDER BY rank_points DESC, wins DESC LIMIT 5'
+    );
+    const format = (rows) => rows.map(r => ({
+        ...r,
+        rankInfo: getRankInfo(r.rank_points)
+    }));
+    return {
+        byWins: format(winsRes.rows),
+        byRank: format(rankRes.rows)
+    };
+}
+
+async function broadcastRankings() {
+    try {
+        const data = await fetchRankingsData();
+        io.emit('rankingsUpdated', data);
+    } catch (e) {
+        console.error('ランキングブロードキャストエラー:', e);
+    }
+}
+
 // 認証ミドルウェア
 function authenticateToken(req, res, next) {
     const authHeader = req.headers['authorization'];
@@ -62,6 +89,8 @@ app.post('/api/register', async (req, res) => {
         );
         const newUser = result.rows[0];
         const token = jwt.sign({ id: newUser.id, username: newUser.username }, JWT_SECRET, { expiresIn: '7d' });
+
+        await broadcastRankings();
         res.json({ token, username: newUser.username });
     } catch (err) {
         if (err.code === '23505') {
@@ -111,20 +140,8 @@ app.get('/api/me', authenticateToken, async (req, res) => {
 // ランキング取得（勝利数トップ5 & ランク上位トップ5）
 app.get('/api/rankings', async (req, res) => {
     try {
-        const winsRes = await pool.query(
-            'SELECT username, wins, rank_points FROM users ORDER BY wins DESC, rank_points DESC LIMIT 5'
-        );
-        const rankRes = await pool.query(
-            'SELECT username, rank_points, wins FROM users ORDER BY rank_points DESC, wins DESC LIMIT 5'
-        );
-        const format = (rows) => rows.map(r => ({
-            ...r,
-            rankInfo: getRankInfo(r.rank_points)
-        }));
-        res.json({
-            byWins: format(winsRes.rows),
-            byRank: format(rankRes.rows)
-        });
+        const data = await fetchRankingsData();
+        res.json(data);
     } catch (err) {
         res.status(500).json({ error: 'ランキング取得エラー' });
     }
@@ -154,6 +171,7 @@ app.post('/api/change-password', authenticateToken, async (req, res) => {
 app.delete('/api/account', authenticateToken, async (req, res) => {
     try {
         await pool.query('DELETE FROM users WHERE id = $1', [req.user.id]);
+        await broadcastRankings();
         res.json({ message: 'アカウントを削除しました。' });
     } catch (err) {
         res.status(500).json({ error: '削除エラー' });
@@ -240,6 +258,8 @@ async function updateMatchResults(players, loserId, isRanked) {
             console.error('DB更新エラー:', e);
         }
     }
+
+    await broadcastRankings();
     return results;
 }
 
@@ -496,9 +516,9 @@ io.on('connection', (socket) => {
                 isRanked: true,
                 rankedMode: m,
                 state: 'countdown',
-                isRandomTarget: true, // ランク戦は30〜50ランダム
+                isRandomTarget: true,
                 targetNumber: 30,
-                turnTimeLimit: 30, // ランク戦は30秒固定
+                turnTimeLimit: 30,
                 players: matchedSockets.map(s => ({
                     socketId: s.id,
                     userId: s.user.id,
