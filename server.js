@@ -46,9 +46,9 @@ function authenticateToken(req, res, next) {
     });
 }
 
-// ================= REST API (認証・統計・ランキング・設定) =================
+// ================= REST API =================
 
-// 新規登録
+// 新規登録（登録後すぐにログインできるようトークンを発行）
 app.post('/api/register', async (req, res) => {
     const { username, password } = req.body;
     if (!username || !password || username.length > 20) {
@@ -56,11 +56,13 @@ app.post('/api/register', async (req, res) => {
     }
     try {
         const hash = await bcrypt.hash(password, 10);
-        await pool.query(
+        const result = await pool.query(
             'INSERT INTO users (username, password_hash) VALUES ($1, $2) RETURNING id, username',
             [username, hash]
         );
-        res.json({ message: '登録完了しました。ログインしてください。' });
+        const newUser = result.rows[0];
+        const token = jwt.sign({ id: newUser.id, username: newUser.username }, JWT_SECRET, { expiresIn: '7d' });
+        res.json({ token, username: newUser.username });
     } catch (err) {
         if (err.code === '23505') {
             return res.status(400).json({ error: 'そのユーザー名は既に使用されています。' });
@@ -160,17 +162,33 @@ app.delete('/api/account', authenticateToken, async (req, res) => {
 
 // ================= SOCKET.IO リアルタイム対戦管理 =================
 
-const rooms = new Map(); // roomId -> roomObject
-const rankedQueues = { 2: [], 3: [] }; // ランクマッチ待機列
+const rooms = new Map();
+const rankedQueues = { 2: [], 3: [] };
 
+// 4桁の数字コード生成
 function generateRoomCode() {
-    const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
     let code = '';
-    for (let i = 0; i < 6; i++) code += chars[Math.floor(Math.random() * chars.length)];
+    for (let i = 0; i < 4; i++) {
+        code += Math.floor(Math.random() * 10).toString();
+    }
     return rooms.has(code) ? generateRoomCode() : code;
 }
 
-// DB結果更新（勝利・敗北・ランクポイント計算）
+// クライアントに送信する安全なルーム情報（ランダムモード時は目標数字を隠す）
+function serializeRoom(room) {
+    return {
+        id: room.id,
+        hostId: room.hostId,
+        isRanked: room.isRanked,
+        state: room.state,
+        isRandomTarget: room.isRandomTarget,
+        targetNumber: room.isRandomTarget ? null : room.targetNumber,
+        turnTimeLimit: room.turnTimeLimit,
+        players: room.players
+    };
+}
+
+// DB結果更新
 async function updateMatchResults(players, loserId, isRanked) {
     const results = [];
     for (const p of players) {
@@ -186,12 +204,12 @@ async function updateMatchResults(players, loserId, isRanked) {
 
             if (isRanked) {
                 if (isWinner) {
-                    pointChange = Math.floor(Math.random() * (40 - 25 + 1)) + 25; // +25 ~ +40
+                    pointChange = Math.floor(Math.random() * (40 - 25 + 1)) + 25;
                 } else {
                     if (currentRank.name === 'ブロンズ' || currentRank.name === 'シルバー') {
-                        pointChange = -Math.floor(Math.random() * 11); // 0 ~ -10
+                        pointChange = -Math.floor(Math.random() * 11);
                     } else {
-                        pointChange = -(Math.floor(Math.random() * (30 - 10 + 1)) + 10); // -10 ~ -30
+                        pointChange = -(Math.floor(Math.random() * (30 - 10 + 1)) + 10);
                     }
                 }
             }
@@ -241,7 +259,26 @@ function startTurnTimer(room) {
     }, 1000);
 }
 
-async function finishGame(room, loserUserId, reasonText, isDisconnect = false) {
+// ターン交代共通処理
+function advanceTurn(room, currentPlayer) {
+    const added = room.turnAdded;
+    room.turnAdded = 0;
+    room.turnIndex = (room.turnIndex + 1) % room.players.length;
+
+    io.to(room.id).emit('chatMessage', {
+        system: true,
+        text: `${currentPlayer.username}さんが +${added} 追加しました！`
+    });
+
+    io.to(room.id).emit('turnChanged', {
+        turnIndex: room.turnIndex,
+        currentNumber: room.currentNumber
+    });
+
+    startTurnTimer(room);
+}
+
+async function finishGame(room, loserUserId, reasonText) {
     if (room.state === 'finished') return;
     room.state = 'finished';
     if (room.timer) clearInterval(room.timer);
@@ -256,7 +293,6 @@ async function finishGame(room, loserUserId, reasonText, isDisconnect = false) {
     });
 
     if (room.isRanked) {
-        // ランク戦の場合はルームを削除
         room.players.forEach(p => {
             const s = io.sockets.sockets.get(p.socketId);
             if (s) {
@@ -274,11 +310,16 @@ async function finishGame(room, loserUserId, reasonText, isDisconnect = false) {
         room.players.forEach(p => {
             p.ready = (p.userId === room.hostId);
         });
-        io.to(room.id).emit('roomUpdated', room);
+        io.to(room.id).emit('roomUpdated', serializeRoom(room));
     }
 }
 
 function beginCountdownAndStart(room) {
+    // ランダム設定の場合はここで初めて30〜50の数字を決定
+    if (room.isRandomTarget) {
+        room.targetNumber = Math.floor(Math.random() * (50 - 30 + 1)) + 30;
+    }
+
     room.state = 'countdown';
     let count = 3;
     io.to(room.id).emit('countdown', count);
@@ -326,19 +367,17 @@ io.use(async (socket, next) => {
 });
 
 io.on('connection', (socket) => {
-    // カスタム部屋作成
-    socket.on('createRoom', ({ targetNumber, turnTimeLimit }) => {
+    // カスタム部屋作成（押したら即座に部屋作成しロビー画面へ）
+    socket.on('createRoom', () => {
         const code = generateRoomCode();
-        const target = Math.max(10, Math.min(200, parseInt(targetNumber) || 30));
-        const limit = Math.max(30, Math.min(180, parseInt(turnTimeLimit) || 30));
-
         const room = {
             id: code,
             hostId: socket.user.id,
             isRanked: false,
             state: 'lobby',
-            targetNumber: target,
-            turnTimeLimit: limit,
+            isRandomTarget: false,
+            targetNumber: 30,
+            turnTimeLimit: 30,
             players: [{
                 socketId: socket.id,
                 userId: socket.user.id,
@@ -355,12 +394,12 @@ io.on('connection', (socket) => {
         rooms.set(code, room);
         socket.join(code);
         socket.roomId = code;
-        socket.emit('roomJoined', room);
+        socket.emit('roomJoined', serializeRoom(room));
     });
 
-    // 部屋コードで参加
+    // 4桁の数字コードで参加
     socket.on('joinRoom', ({ code }) => {
-        const roomCode = (code || '').toUpperCase().trim();
+        const roomCode = (code || '').trim();
         const room = rooms.get(roomCode);
         if (!room) return socket.emit('errorMsg', '部屋が見つかりません。');
         if (room.state !== 'lobby') return socket.emit('errorMsg', '既にゲームが開始されています。');
@@ -377,22 +416,24 @@ io.on('connection', (socket) => {
 
         socket.join(roomCode);
         socket.roomId = roomCode;
-        socket.emit('roomJoined', room);
-        io.to(roomCode).emit('roomUpdated', room);
+        const serialized = serializeRoom(room);
+        socket.emit('roomJoined', serialized);
+        io.to(roomCode).emit('roomUpdated', serialized);
     });
 
-    // ホストによる部屋ルール（目標数字・制限時間）の変更（準備OK状態は維持）
-    socket.on('updateRoomSettings', ({ targetNumber, turnTimeLimit }) => {
+    // ホストによる部屋ルール（目標数字・ランダム切替・制限時間）のリアルタイム変更
+    socket.on('updateRoomSettings', ({ isRandomTarget, targetNumber, turnTimeLimit }) => {
         const room = rooms.get(socket.roomId);
         if (!room || room.state !== 'lobby' || room.hostId !== socket.user.id) return;
 
-        const target = Math.max(10, Math.min(200, parseInt(targetNumber) || 30));
-        const limit = Math.max(30, Math.min(180, parseInt(turnTimeLimit) || 30));
+        room.isRandomTarget = Boolean(isRandomTarget);
+        if (!room.isRandomTarget) {
+            room.targetNumber = Math.max(10, Math.min(200, parseInt(targetNumber) || 30));
+        }
+        // 制限時間は10秒〜90秒（1分30秒）の間
+        room.turnTimeLimit = Math.max(10, Math.min(90, parseInt(turnTimeLimit) || 30));
 
-        room.targetNumber = target;
-        room.turnTimeLimit = limit;
-
-        io.to(room.id).emit('roomUpdated', room);
+        io.to(room.id).emit('roomUpdated', serializeRoom(room));
     });
 
     // 準備OK切り替え
@@ -402,7 +443,7 @@ io.on('connection', (socket) => {
         const player = room.players.find(p => p.userId === socket.user.id);
         if (player) {
             player.ready = !player.ready;
-            io.to(room.id).emit('roomUpdated', room);
+            io.to(room.id).emit('roomUpdated', serializeRoom(room));
         }
     });
 
@@ -414,7 +455,7 @@ io.on('connection', (socket) => {
             const j = Math.floor(Math.random() * (i + 1));
             [room.players[i], room.players[j]] = [room.players[j], room.players[i]];
         }
-        io.to(room.id).emit('roomUpdated', room);
+        io.to(room.id).emit('roomUpdated', serializeRoom(room));
     });
 
     // ゲーム開始（通常スタート / 強制スタート）
@@ -432,7 +473,7 @@ io.on('connection', (socket) => {
 
     // ロビーに戻る（部屋退出）
     socket.on('leaveLobby', () => {
-        handlePlayerLeave(socket, false);
+        handlePlayerLeave(socket);
     });
 
     // オンラインランクマッチ参加 (mode: 2 or 3)
@@ -448,7 +489,6 @@ io.on('connection', (socket) => {
         if (rankedQueues[m].length >= m) {
             const matchedSockets = rankedQueues[m].splice(0, m);
             const code = 'RANK-' + generateRoomCode();
-            const target = Math.floor(Math.random() * (50 - 30 + 1)) + 30;
 
             const room = {
                 id: code,
@@ -456,8 +496,9 @@ io.on('connection', (socket) => {
                 isRanked: true,
                 rankedMode: m,
                 state: 'countdown',
-                targetNumber: target,
-                turnTimeLimit: 30,
+                isRandomTarget: true, // ランク戦は30〜50ランダム
+                targetNumber: 30,
+                turnTimeLimit: 30, // ランク戦は30秒固定
                 players: matchedSockets.map(s => ({
                     socketId: s.id,
                     userId: s.user.id,
@@ -478,7 +519,7 @@ io.on('connection', (socket) => {
                 s.rankedMode = null;
                 s.join(code);
                 s.roomId = code;
-                s.emit('rankedMatched', room);
+                s.emit('rankedMatched', serializeRoom(room));
             });
 
             beginCountdownAndStart(room);
@@ -492,16 +533,13 @@ io.on('connection', (socket) => {
         socket.rankedMode = null;
     });
 
-    // 数字を増やす（円いボタンタップ）
-    socket.on('incrementNumber', () => {
+    // 数字を増やす（3回押したら強制的に次のプレイヤーへチェンジ）
+    socket.on('incrementNumber', async () => {
         const room = rooms.get(socket.roomId);
         if (!room || room.state !== 'playing') return;
         const currentPlayer = room.players[room.turnIndex];
         if (currentPlayer.userId !== socket.user.id) return;
-
-        if (room.turnAdded >= 3) {
-            return socket.emit('errorMsg', '1ターンに追加できるのは最大3までです。「決定（次の人へ）」を押してください。');
-        }
+        if (room.turnAdded >= 3) return;
 
         room.currentNumber += 1;
         room.turnAdded += 1;
@@ -512,16 +550,23 @@ io.on('connection', (socket) => {
             turnAdded: room.turnAdded
         });
 
+        // 決めた数字に達したら即負け
         if (room.currentNumber >= room.targetNumber) {
             io.to(room.id).emit('chatMessage', {
                 system: true,
                 text: `${currentPlayer.username}さんが +${room.turnAdded} 追加し、目標の ${room.targetNumber} に到達しました！`
             });
-            finishGame(room, currentPlayer.userId, `${currentPlayer.username}さんが「${room.targetNumber}」を言ってしまいました！`);
+            await finishGame(room, currentPlayer.userId, `${currentPlayer.username}さんが「${room.targetNumber}」を言ってしまいました！`);
+            return;
+        }
+
+        // 3回押したら強制的に次のユーザーへターンチェンジ
+        if (room.turnAdded >= 3) {
+            advanceTurn(room, currentPlayer);
         }
     });
 
-    // ターン確定（次の人へ）
+    // ターン確定（1〜2回押した時点で次の人へ）
     socket.on('endTurn', () => {
         const room = rooms.get(socket.roomId);
         if (!room || room.state !== 'playing') return;
@@ -532,21 +577,7 @@ io.on('connection', (socket) => {
             return socket.emit('errorMsg', '最低1つは数字を増やしてください！');
         }
 
-        const added = room.turnAdded;
-        room.turnAdded = 0;
-        room.turnIndex = (room.turnIndex + 1) % room.players.length;
-
-        io.to(room.id).emit('chatMessage', {
-            system: true,
-            text: `${currentPlayer.username}さんが +${added} 追加しました！`
-        });
-
-        io.to(room.id).emit('turnChanged', {
-            turnIndex: room.turnIndex,
-            currentNumber: room.currentNumber
-        });
-
-        startTurnTimer(room);
+        advanceTurn(room, currentPlayer);
     });
 
     // ゲーム内チャット
@@ -565,10 +596,10 @@ io.on('connection', (socket) => {
     socket.on('disconnect', () => {
         rankedQueues[2] = rankedQueues[2].filter(s => s.id !== socket.id);
         rankedQueues[3] = rankedQueues[3].filter(s => s.id !== socket.id);
-        handlePlayerLeave(socket, true);
+        handlePlayerLeave(socket);
     });
 
-    async function handlePlayerLeave(sock, isDisconnect) {
+    async function handlePlayerLeave(sock) {
         const room = rooms.get(sock.roomId);
         if (!room) return;
 
@@ -584,13 +615,13 @@ io.on('connection', (socket) => {
                     room.hostId = room.players[0].userId;
                     room.players[0].ready = true;
                 }
-                io.to(room.id).emit('roomUpdated', room);
+                io.to(room.id).emit('roomUpdated', serializeRoom(room));
             }
         } else if (room.state === 'playing' || room.state === 'countdown') {
             const leaverId = sock.user.id;
             const leaverName = sock.user.username;
 
-            await finishGame(room, leaverId, `${leaverName}さんがゲームから離脱しました！`, true);
+            await finishGame(room, leaverId, `${leaverName}さんがゲームから離脱しました！`);
 
             if (!room.isRanked) {
                 room.players = room.players.filter(p => p.userId !== leaverId);
@@ -603,7 +634,7 @@ io.on('connection', (socket) => {
                         room.hostId = room.players[0].userId;
                         room.players[0].ready = true;
                     }
-                    io.to(room.id).emit('roomUpdated', room);
+                    io.to(room.id).emit('roomUpdated', serializeRoom(room));
                 }
             }
         }

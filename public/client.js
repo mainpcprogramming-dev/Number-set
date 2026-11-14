@@ -5,6 +5,7 @@ let authMode = 'login';
 let rankingsData = { byWins: [], byRank: [] };
 let currentRoom = null;
 let lastRankedMode = 2;
+let isRandomTargetMode = false;
 
 // 初期化
 window.onload = () => {
@@ -16,6 +17,7 @@ window.onload = () => {
 function showScreen(screenId) {
     document.querySelectorAll('.screen').forEach(s => s.classList.remove('active'));
     document.getElementById(screenId).classList.add('active');
+    window.scrollTo(0, 0);
 }
 
 function openModal(id) { document.getElementById(id).classList.add('active'); }
@@ -50,15 +52,12 @@ async function handleAuth(e) {
             return;
         }
 
-        if (authMode === 'register') {
-            msgEl.style.color = '#34d399';
-            msgEl.textContent = data.message;
-            switchAuthTab('login');
-        } else {
-            token = data.token;
-            localStorage.setItem('token', token);
-            initApp();
-        }
+        // 新規登録・ログインともにトークンを保存して即座にホーム画面へ移動
+        token = data.token;
+        localStorage.setItem('token', token);
+        document.getElementById('auth-username').value = '';
+        document.getElementById('auth-password').value = '';
+        initApp();
     } catch (err) {
         msgEl.textContent = '通信エラーが発生しました。';
     }
@@ -105,7 +104,6 @@ async function loadRankings() {
     }
 }
 
-// スライダー切り替え（ランク上位 ⇔ 勝利回数）
 function toggleRankingView() {
     const isWins = document.getElementById('ranking-slider').checked;
     document.getElementById('label-rank').classList.toggle('active-label', !isWins);
@@ -185,16 +183,17 @@ function connectSocket() {
 
     socket.on('errorMsg', (msg) => alert(msg));
 
-    // カスタム部屋参加・更新
+    // カスタム部屋参加・リアルタイム更新
     socket.on('roomJoined', (room) => {
         currentRoom = room;
-        closeModal('create-room-modal');
+        isRandomTargetMode = room.isRandomTarget;
         renderLobby(room);
         showScreen('lobby-screen');
     });
 
     socket.on('roomUpdated', (room) => {
         currentRoom = room;
+        isRandomTargetMode = room.isRandomTarget;
         renderLobby(room);
     });
 
@@ -217,12 +216,13 @@ function connectSocket() {
         document.getElementById('countdown-number').textContent = count;
     });
 
-    // ゲーム開始
+    // ゲーム開始（ランダム設定の場合もここで初めて確定数字が表示される）
     socket.on('gameStarted', (data) => {
         document.getElementById('countdown-overlay').classList.add('hidden');
-        document.getElementById('chat-messages').innerHTML = ''; // チャット完全リセット
+        document.getElementById('chat-messages').innerHTML = '';
         document.getElementById('game-target-num').textContent = data.targetNumber;
         document.getElementById('game-timer').textContent = data.timeLimit;
+        document.getElementById('turn-added-count').textContent = 0;
         
         currentRoom = { ...currentRoom, ...data };
         updateCountDisplay(0, data.targetNumber);
@@ -237,7 +237,7 @@ function connectSocket() {
     });
 
     // ターン交代
-    socket.on('turnChanged', ({ turnIndex, currentNumber }) => {
+    socket.on('turnChanged', ({ turnIndex }) => {
         currentRoom.turnIndex = turnIndex;
         document.getElementById('turn-added-count').textContent = 0;
         renderGamePlayers(currentRoom.players, turnIndex);
@@ -298,36 +298,35 @@ function connectSocket() {
     });
 }
 
-// 部屋作成・参加操作
-function openCreateRoomModal() { openModal('create-room-modal'); }
-function setRandomTarget() {
-    document.getElementById('room-target-num').value = Math.floor(Math.random() * (50 - 30 + 1)) + 30;
-}
+// 部屋作成（押したら即座に部屋を作成してロビーへ）
 function createRoom() {
-    const targetNumber = document.getElementById('room-target-num').value;
-    const turnTimeLimit = document.getElementById('room-time-limit').value;
-    socket.emit('createRoom', { targetNumber, turnTimeLimit });
-}
-function joinRoomByCode() {
-    const code = document.getElementById('join-code-input').value;
-    if (!code) return alert('部屋コードを入力してください');
-    socket.emit('joinRoom', { code });
+    socket.emit('createRoom');
 }
 
-// ロビー描画・操作
+function joinRoomByCode() {
+    const code = document.getElementById('join-code-input').value.trim();
+    if (!/^\d{4}$/.test(code)) return alert('4桁の数字コードを入力してください');
+    socket.emit('joinRoom', { code });
+    document.getElementById('join-code-input').value = '';
+}
+
+// ロビー描画（リアルタイム反映）
 function renderLobby(room) {
     document.getElementById('lobby-room-code').textContent = room.id;
-    document.getElementById('lobby-target').textContent = room.targetNumber;
+    document.getElementById('lobby-target').textContent = room.isRandomTarget ? '？？？ (ランダム)' : room.targetNumber;
     document.getElementById('lobby-time').textContent = room.turnTimeLimit;
 
     const isHost = room.hostId === currentUser.id;
 
-    // ホストとゲストでルール表示/編集エリアを切り替え
     document.getElementById('lobby-rules-view').classList.toggle('hidden', isHost);
     document.getElementById('lobby-rules-edit').classList.toggle('hidden', !isHost);
 
     if (isHost) {
-        document.getElementById('lobby-edit-target').value = room.targetNumber;
+        updateTargetModeUI(room.isRandomTarget);
+        const targetInput = document.getElementById('lobby-edit-target');
+        if (!room.isRandomTarget && document.activeElement !== targetInput) {
+            targetInput.value = room.targetNumber;
+        }
         document.getElementById('lobby-edit-time').value = String(room.turnTimeLimit);
     }
 
@@ -335,9 +334,17 @@ function renderLobby(room) {
     ul.innerHTML = '';
     room.players.forEach((p, i) => {
         const li = document.createElement('li');
-        const hostTag = p.userId === room.hostId ? ' 👑(ホスト)' : '';
+        const hostTag = p.userId === room.hostId ? '👑' : '';
         const readyTag = p.ready ? '✅ 準備OK' : '⏳ 待機中';
-        li.innerHTML = `<span>${i + 1}. ${p.username} <small class="badge">${p.rankInfo.badge}</small>${hostTag}</span><span>${readyTag}</span>`;
+        li.innerHTML = `
+            <div class="player-info-left">
+                <span>${i + 1}.</span>
+                <span class="player-name-text">${p.username}</span>
+                <span class="badge">${p.rankInfo.badge}</span>
+                <span>${hostTag}</span>
+            </div>
+            <span class="player-status-right">${readyTag}</span>
+        `;
         ul.appendChild(li);
     });
 
@@ -350,16 +357,29 @@ function renderLobby(room) {
     }
 }
 
-function setLobbyRandomTarget() {
-    const rand = Math.floor(Math.random() * (50 - 30 + 1)) + 30;
-    document.getElementById('lobby-edit-target').value = rand;
-    updateRoomSettings();
+function updateTargetModeUI(isRandom) {
+    isRandomTargetMode = isRandom;
+    document.getElementById('mode-fixed-btn').classList.toggle('active', !isRandom);
+    document.getElementById('mode-random-btn').classList.toggle('active', isRandom);
+    document.getElementById('fixed-target-box').classList.toggle('hidden', isRandom);
+    document.getElementById('random-target-box').classList.toggle('hidden', !isRandom);
 }
 
-function updateRoomSettings() {
+// 数字指定 vs ランダムの切り替え（即座に全員へ送信）
+function setTargetMode(isRandom) {
+    updateTargetModeUI(isRandom);
+    emitRoomSettings();
+}
+
+// ホストが数字や時間を変更するたびにリアルタイムでサーバーへ送信
+function emitRoomSettings() {
     const targetNumber = document.getElementById('lobby-edit-target').value;
     const turnTimeLimit = document.getElementById('lobby-edit-time').value;
-    socket.emit('updateRoomSettings', { targetNumber, turnTimeLimit });
+    socket.emit('updateRoomSettings', {
+        isRandomTarget: isRandomTargetMode,
+        targetNumber,
+        turnTimeLimit
+    });
 }
 
 function toggleReady() { socket.emit('toggleReady'); }
@@ -372,9 +392,14 @@ function leaveLobby() {
 
 // ランク戦操作
 function joinRanked(mode) { socket.emit('joinRanked', { mode }); }
-function cancelRanked() {
+
+// キャンセル時は必ずホーム画面へ強制移動（もう一度遊ぶ後のキャンセルにも対応）
+async function cancelRanked() {
     socket.emit('cancelRanked');
     closeModal('matching-modal');
+    await loadUserProfile();
+    await loadRankings();
+    showScreen('home-screen');
 }
 
 // ゲーム中UI更新
