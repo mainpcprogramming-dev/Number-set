@@ -1,0 +1,303 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>COUNT OUT - 数字を言ったら負けゲーム</title>
+    <link rel="stylesheet" href="style.css">
+    <script src="/socket.io/socket.io.js"></script>
+</head>
+<body>
+
+    <!-- 1. 認証画面（新規登録・ログイン） -->
+    <div id="auth-screen" class="screen active">
+        <div class="card auth-card">
+            <h1>🔢 COUNT OUT</h1>
+            <p class="subtitle">決めた数字を言ったら負けの心理戦ゲーム</p>
+            
+            <div class="tabs">
+                <button id="tab-login" class="tab active" onclick="switchAuthTab('login')">ログイン</button>
+                <button id="tab-register" class="tab" onclick="switchAuthTab('register')">新規登録</button>
+            </div>
+
+            <form id="auth-form" onsubmit="handleAuth(event)">
+                <input type="text" id="auth-username" placeholder="ユーザー名 (20文字以内)" required maxlength="20">
+                <input type="password" id="auth-password" placeholder="パスワード" required>
+                <button type="submit" id="auth-submit-btn" class="btn primary">ログイン</button>
+            </form>
+            <p id="auth-msg" class="msg"></p>
+        </div>
+    </div>
+
+    <!-- 2. ホーム画面 -->
+    <div id="home-screen" class="screen">
+        <header class="top-bar">
+            <div class="user-profile">
+                <span id="home-username" class="username"></span>
+                <span id="home-rank-badge" class="badge"></span>
+            </div>
+            <div class="header-actions">
+                <button class="btn icon-btn" onclick="openSettings()">⚙️ 設定</button>
+                <button class="btn danger-outline" onclick="logout()">ログアウト</button>
+            </div>
+        </header>
+
+        <main class="home-grid">
+            <!-- プレイヤー統計 -->
+            <section class="card stats-card">
+                <h2>📊 プレイヤー統計</h2>
+                <div class="stats-grid">
+                    <div class="stat-box">
+                        <span class="stat-label">プレイ回数</span>
+                        <span id="stat-played" class="stat-value">0</span>
+                    </div>
+                    <div class="stat-box">
+                        <span class="stat-label">勝利回数</span>
+                        <span id="stat-wins" class="stat-value">0</span>
+                    </div>
+                    <div class="stat-box">
+                        <span class="stat-label">勝率</span>
+                        <span id="stat-winrate" class="stat-value">0%</span>
+                    </div>
+                    <div class="stat-box">
+                        <span class="stat-label">最高ランク</span>
+                        <span id="stat-maxrank" class="stat-value">-</span>
+                    </div>
+                </div>
+            </section>
+
+            <!-- 対戦モード選択 -->
+            <section class="card play-card">
+                <h2>🎮 対戦モード</h2>
+                
+                <div class="mode-group">
+                    <h3>🏆 オンラインランク対戦</h3>
+                    <p class="hint">自動マッチング・数字30〜50ランダム・勝敗でランクポイント変動</p>
+                    <div class="btn-row">
+                        <button class="btn rank-btn" onclick="joinRanked(2)">2人専用ランク戦</button>
+                        <button class="btn rank-btn" onclick="joinRanked(3)">3人専用ランク戦</button>
+                    </div>
+                </div>
+
+                <hr>
+
+                <div class="mode-group">
+                    <h3>🏠 カスタム部屋（フレンド対戦）</h3>
+                    <p class="hint">勝利数のみカウント（ランクポイント変動なし）</p>
+                    <button class="btn primary full" onclick="openCreateRoomModal()">＋ 部屋を作成する</button>
+                    <div class="join-row">
+                        <input type="text" id="join-code-input" placeholder="6桁の部屋コード" maxlength="6">
+                        <button class="btn secondary" onclick="joinRoomByCode()">コードで参加</button>
+                    </div>
+                </div>
+            </section>
+
+            <!-- ランキング（スライダー切り替え） -->
+            <section class="card ranking-card">
+                <div class="ranking-header">
+                    <h2>👑 ランキング (TOP 5)</h2>
+                    <div class="slider-toggle">
+                        <span id="label-rank" class="active-label">ランク上位</span>
+                        <label class="switch">
+                            <input type="checkbox" id="ranking-slider" onchange="toggleRankingView()">
+                            <span class="slider"></span>
+                        </label>
+                        <span id="label-wins">勝利回数</span>
+                    </div>
+                </div>
+                <ul id="ranking-list" class="ranking-list"></ul>
+            </section>
+        </main>
+    </div>
+
+    <!-- 部屋作成モーダル -->
+    <div id="create-room-modal" class="modal">
+        <div class="modal-content card">
+            <h2>🏠 部屋の設定</h2>
+            <label>負けになる目標数字（10〜200）</label>
+            <div class="input-with-btn">
+                <input type="number" id="room-target-num" value="30" min="10" max="200">
+                <button type="button" class="btn secondary" onclick="setRandomTarget()">🎲 ランダム(30〜50)</button>
+            </div>
+
+            <label>各プレイヤーの制限時間（30秒〜3分）</label>
+            <select id="room-time-limit">
+                <option value="30">30秒</option>
+                <option value="60">1分 (60秒)</option>
+                <option value="90">1分30秒</option>
+                <option value="120">2分 (120秒)</option>
+                <option value="180">3分 (180秒)</option>
+            </select>
+
+            <div class="modal-actions">
+                <button class="btn" onclick="closeModal('create-room-modal')">キャンセル</button>
+                <button class="btn primary" onclick="createRoom()">部屋を作成</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- ランクマッチング待機モーダル -->
+    <div id="matching-modal" class="modal">
+        <div class="modal-content card center">
+            <h2>🔍 対戦相手を探しています...</h2>
+            <p id="matching-status">マッチング中...</p>
+            <div class="loader"></div>
+            <button class="btn danger" onclick="cancelRanked()">キャンセル</button>
+        </div>
+    </div>
+
+    <!-- 設定モーダル -->
+    <div id="settings-modal" class="modal">
+        <div class="modal-content card">
+            <h2>⚙️ アカウント設定</h2>
+            <div class="setting-info">
+                <p>アカウント名: <strong id="setting-username"></strong></p>
+                <p>パスワード: <strong>********</strong></p>
+            </div>
+
+            <hr>
+            <h3>パスワード変更</h3>
+            <input type="password" id="old-password" placeholder="現在のパスワード">
+            <input type="password" id="new-password" placeholder="新しいパスワード">
+            <button class="btn primary full" onclick="changePassword()">パスワードを変更する</button>
+
+            <hr>
+            <h3>危険な操作</h3>
+            <button class="btn danger full" onclick="confirmDeleteAccount()">アカウントを削除する</button>
+            
+            <div id="delete-confirm-box" class="confirm-box hidden">
+                <p>本当に削除しますか？（ランキングや戦績もすべて削除されます）</p>
+                <div class="btn-row">
+                    <button class="btn danger" onclick="deleteAccount()">はい</button>
+                    <button class="btn" onclick="hideDeleteConfirm()">いいえ</button>
+                </div>
+            </div>
+
+            <div class="modal-actions">
+                <button class="btn" onclick="closeModal('settings-modal')">閉じる</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- 3. ロビー画面（カスタム部屋待機） -->
+    <div id="lobby-screen" class="screen">
+        <div class="card lobby-card">
+            <div class="lobby-top">
+                <button class="btn" onclick="leaveLobby()">← ロビーに戻る</button>
+                <div class="room-code-box">
+                    部屋コード: <span id="lobby-room-code" class="code-text"></span>
+                </div>
+            </div>
+
+            <!-- ゲスト用：現在のルール表示 -->
+            <div id="lobby-rules-view" class="lobby-rules">
+                <span>🎯 目標数字: <strong id="lobby-target"></strong></span>
+                <span>⏱️ 制限時間: <strong id="lobby-time"></strong>秒</span>
+            </div>
+
+            <!-- ホスト用：ルール編集フォーム -->
+            <div id="lobby-rules-edit" class="lobby-rules-edit hidden">
+                <div class="edit-row">
+                    <label>🎯 目標数字:</label>
+                    <input type="number" id="lobby-edit-target" min="10" max="200">
+                    <button type="button" class="btn secondary" onclick="setLobbyRandomTarget()">🎲 30〜50</button>
+                </div>
+                <div class="edit-row">
+                    <label>⏱️ 制限時間:</label>
+                    <select id="lobby-edit-time">
+                        <option value="30">30秒</option>
+                        <option value="60">1分 (60秒)</option>
+                        <option value="90">1分30秒</option>
+                        <option value="120">2分 (120秒)</option>
+                        <option value="180">3分 (180秒)</option>
+                    </select>
+                    <button type="button" class="btn primary" onclick="updateRoomSettings()">設定を反映</button>
+                </div>
+            </div>
+
+            <h3>参加プレイヤー（上から順番に開始）</h3>
+            <ul id="lobby-player-list" class="player-list"></ul>
+
+            <div class="lobby-controls">
+                <button id="btn-ready" class="btn secondary" onclick="toggleReady()">準備OK</button>
+                <button id="btn-shuffle" class="btn hidden" onclick="shuffleOrder()">🔀 順番シャッフル</button>
+            </div>
+
+            <div id="host-start-controls" class="host-controls hidden">
+                <button id="btn-start-normal" class="btn primary" onclick="startCustomGame(false)">ゲーム開始</button>
+                <button id="btn-start-force" class="btn warning" onclick="startCustomGame(true)">⚡ 強制スタート</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- 4. ゲーム画面 -->
+    <div id="game-screen" class="screen">
+        <!-- カウントダウンオーバーレイ -->
+        <div id="countdown-overlay" class="overlay hidden">
+            <div id="countdown-number" class="countdown-text">3</div>
+        </div>
+
+        <!-- あなたの番通知バナー -->
+        <div id="your-turn-banner" class="turn-banner hidden">あなたの番です！</div>
+
+        <div class="game-layout">
+            <!-- 左/上：ゲームメインエリア -->
+            <div class="card game-main">
+                <div class="game-header">
+                    <div>目標のNG数字: <strong id="game-target-num" class="target-highlight">30</strong></div>
+                    <div class="timer-box">残り時間: <span id="game-timer">30</span>秒</div>
+                </div>
+
+                <!-- プレイヤー順番バー -->
+                <div id="game-players-bar" class="players-bar"></div>
+
+                <!-- 中央の数字とタップボタン -->
+                <div class="counter-area">
+                    <div id="current-count-display" class="count-number">0</div>
+                    <p class="tap-hint">1ターンにつき +1 〜 +3 まで追加可能（現在: +<span id="turn-added-count">0</span>）</p>
+                    
+                    <button id="tap-circle-btn" class="circle-btn" onclick="tapIncrement()" disabled>
+                        +1<br><span>TAP!</span>
+                    </button>
+
+                    <button id="end-turn-btn" class="btn primary turn-end-btn" onclick="endTurn()" disabled>
+                        決定（次の人へ）
+                    </button>
+                </div>
+            </div>
+
+            <!-- 右/下：ゲーム内チャット -->
+            <div class="card game-chat">
+                <h3>💬 ゲームログ & チャット</h3>
+                <div id="chat-messages" class="chat-box"></div>
+                <form class="chat-form" onsubmit="sendChat(event)">
+                    <input type="text" id="chat-input" placeholder="コメントを入力..." maxlength="100">
+                    <button type="submit" class="btn primary">送信</button>
+                </form>
+            </div>
+        </div>
+    </div>
+
+    <!-- 5. 結果モーダル -->
+    <div id="result-modal" class="modal">
+        <div class="modal-content card center">
+            <h2 id="result-title">ゲーム終了！</h2>
+            <p id="result-reason" class="result-reason"></p>
+            <ul id="result-list" class="result-list"></ul>
+            
+            <!-- ランク戦用のボタン群 -->
+            <div id="result-ranked-actions" class="btn-row hidden" style="margin-top: 16px;">
+                <button class="btn rank-btn" onclick="playRankedAgain()">🔄 もう一度遊ぶ</button>
+                <button class="btn" onclick="returnToHome()">ホームに戻る</button>
+            </div>
+
+            <!-- カスタム部屋用のボタン群 -->
+            <div id="result-custom-actions" class="hidden" style="margin-top: 16px;">
+                <button class="btn primary full" onclick="returnToLobbyFromResult()">🏠 部屋（設定画面）に戻る</button>
+            </div>
+        </div>
+    </div>
+
+    <script src="client.js"></script>
+</body>
+</html>
